@@ -9,6 +9,7 @@
 
 
 import logging
+import math
 import os
 from abc import ABC
 from abc import abstractmethod
@@ -460,6 +461,10 @@ class GraphTransformerBaseBlock(BaseBlock, ABC):
         attn_channels: Optional[int] = None,
         graph_attention_backend: str = "triton",
         edge_pre_mlp: bool = False,
+        taper: bool = False,
+        taper_kind: str = "rbf",
+        taper_sigma_init: float = 1.0,
+        taper_edge_length_index: int = 0,
         **kwargs,
     ) -> None:
         """Initialize GraphTransformerBlock.
@@ -490,6 +495,21 @@ class GraphTransformerBaseBlock(BaseBlock, ABC):
             Backend to use for graph transformer conv, options are "triton" and "pyg"
         edge_pre_mlp: bool, by default False
             Allow for edge feature mixing
+        taper: bool, by default False
+            Add a per-head learnable distance taper to the attention logits. The
+            taper decays a neighbour's weight with edge length, giving the model a
+            smooth distance kernel (see decoder-facetting investigation). Only
+            supported with the "pyg" graph attention backend.
+        taper_kind: str, by default "rbf"
+            Taper functional form: "rbf" gives a logit bias -(d / sigma_h)**2,
+            "alibi" gives -softplus(slope_h) * d, per head h.
+        taper_sigma_init: float, by default 1.0
+            Initial taper length-scale (for "rbf") or initial slope magnitude (for
+            "alibi"), in the *normalised* edge_length units of the graph. Must be
+            chosen to match the graph's edge_length normalisation.
+        taper_edge_length_index: int, by default 0
+            Column index of the scalar edge_length within the raw edge attribute
+            tensor. Defaults to 0 (edge_length first in sub_graph_edge_attributes).
         """
         super().__init__(**kwargs)
 
@@ -557,6 +577,44 @@ class GraphTransformerBaseBlock(BaseBlock, ABC):
         else:
             self.conv = GraphTransformerConv(out_channels=self.out_channels_conv)
 
+        self.taper = taper
+        if self.taper:
+            assert self.graph_attention_backend == "pyg", (
+                "The learnable distance taper is currently only supported with the 'pyg' "
+                "graph attention backend. Set graph_attention_backend='pyg' on this component."
+            )
+            assert taper_kind in ("rbf", "alibi"), f"Unknown taper_kind '{taper_kind}', expected 'rbf' or 'alibi'."
+            self.taper_kind = taper_kind
+            self.taper_edge_length_index = taper_edge_length_index
+            if taper_kind == "rbf":
+                # length-scale per head, log-parametrised for positivity
+                self.taper_log_sigma = nn.Parameter(torch.full((num_heads,), math.log(taper_sigma_init)))
+            else:  # alibi: slope per head, softplus-parametrised for positivity
+                # invert softplus so the initial effective slope equals taper_sigma_init
+                inv = math.log(math.expm1(taper_sigma_init)) if taper_sigma_init > 0 else -10.0
+                self.taper_raw_slope = nn.Parameter(torch.full((num_heads,), inv))
+
+    def compute_taper_bias(self, edge_attr: Tensor) -> Tensor:
+        """Compute the per-head distance taper bias from raw edge attributes.
+
+        Parameters
+        ----------
+        edge_attr : Tensor
+            Raw (un-embedded) edge attributes, shape [num_edges, edge_dim]. The
+            column at ``taper_edge_length_index`` is the scalar edge length.
+
+        Returns
+        -------
+        Tensor
+            Additive pre-softmax logit bias, shape [num_edges, num_heads].
+        """
+        dist = edge_attr[:, self.taper_edge_length_index].unsqueeze(-1)  # [E, 1]
+        if self.taper_kind == "rbf":
+            sigma = self.taper_log_sigma.exp().unsqueeze(0)  # [1, H]
+            return -((dist / sigma) ** 2)
+        slope = nn.functional.softplus(self.taper_raw_slope).unsqueeze(0)  # [1, H]
+        return -dist * slope
+
     def run_node_dst_mlp(self, x, **layer_kwargs):
         return self.node_dst_mlp(self.layer_norm_mlp_dst(x, **layer_kwargs))
 
@@ -621,18 +679,19 @@ class GraphTransformerBaseBlock(BaseBlock, ABC):
         edges: Tensor,
         edge_index: Adj,
         size: Union[int, tuple[int, int]],
+        taper_bias: Optional[Tensor] = None,
     ) -> Tensor:
         # self.conv requires size to be a tuple
         conv_size = (size, size) if isinstance(size, int) else size
 
         if self.graph_attention_backend == "triton":
+            # The taper is gated to the pyg backend at construction time.
             csc, perm, reverse = edge_index_to_csc(edge_index, num_nodes=conv_size, reverse=True)
             edges_csc = edges.index_select(0, perm)
             args_conv = (edges_csc, csc, reverse)
-        else:
-            args_conv = (edges, edge_index, conv_size)
+            return self.conv(query, key, value, *args_conv)
 
-        return self.conv(query, key, value, *args_conv)
+        return self.conv(query, key, value, edges, edge_index, conv_size, taper_bias)
 
     def attention_block(
         self,
@@ -643,9 +702,13 @@ class GraphTransformerBaseBlock(BaseBlock, ABC):
         edge_index: Adj,
         size: Union[int, tuple[int, int]],
         num_chunks: int,
+        taper_bias: Optional[Tensor] = None,
     ) -> Tensor:
         # split 1-hop edges into chunks, compute self.conv chunk-wise
         if num_chunks > 1:
+            # Edge chunking would split the taper bias inconsistently; the mapper
+            # blocks (where the taper is used) always call with num_chunks=1.
+            assert taper_bias is None, "The distance taper is not supported with num_chunks > 1."
             edge_attr_list, edge_index_list = sort_edges_1hop_chunks(
                 num_nodes=size, edge_attr=edges, edge_index=edge_index, num_chunks=num_chunks
             )
@@ -656,7 +719,9 @@ class GraphTransformerBaseBlock(BaseBlock, ABC):
                     query=query, key=key, value=value, edges=edge_attr_list[i], edge_index=edge_index_list[i], size=size
                 )
         else:
-            out = self.apply_gt(query=query, key=key, value=value, edges=edges, edge_index=edge_index, size=size)
+            out = self.apply_gt(
+                query=query, key=key, value=value, edges=edges, edge_index=edge_index, size=size, taper_bias=taper_bias
+            )
 
         return out
 
@@ -820,6 +885,17 @@ class GraphTransformerMapperBlock(GraphTransformerBaseBlock):
 
         x_r = self.lin_self(x[1])
 
+        # Compute the per-head taper bias from the raw edge attributes before they
+        # are embedded by lin_edge (which discards the scalar edge length).
+        taper_bias = None
+        # getattr, not self.taper: anemoi inference checkpoints PICKLE THE MODEL OBJECT, so a
+        # checkpoint trained against stock anemoi.models (no taper code) unpickles without this
+        # attribute while running the current class code. A bare access raises AttributeError on
+        # every such checkpoint -- e.g. the k=12-without-taper ablation arm, job 22483624.
+        if getattr(self, "taper", False):
+            assert self.shard_strategy == "edges", "The distance taper requires shard_strategy='edges'."
+            taper_bias = self.compute_taper_bias(edge_attr)
+
         query, key, value, edges = self.get_qkve(x, edge_attr)
 
         if self.shard_strategy == "heads":
@@ -833,7 +909,7 @@ class GraphTransformerMapperBlock(GraphTransformerBaseBlock):
             query = self.q_norm(query)
             key = self.k_norm(key)
 
-        out = self.attention_block(query, key, value, edges, edge_index, size, num_chunks=1)
+        out = self.attention_block(query, key, value, edges, edge_index, size, num_chunks=1, taper_bias=taper_bias)
 
         if self.shard_strategy == "heads":
             out = self.shard_output_seq(out, shapes, batch_size, model_comm_group)

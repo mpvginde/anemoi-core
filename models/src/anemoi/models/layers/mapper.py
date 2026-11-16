@@ -154,6 +154,10 @@ class GraphTransformerBaseMapper(BaseMapper, ABC):
         shard_strategy: str = "edges",
         graph_attention_backend: str = "triton",
         edge_pre_mlp: bool = False,
+        taper: bool = False,
+        taper_kind: str = "rbf",
+        taper_sigma_init: float = 1.0,
+        taper_edge_length_index: int = 0,
         **kwargs,
     ) -> None:
         """Initialize GraphTransformerBaseMapper.
@@ -222,6 +226,10 @@ class GraphTransformerBaseMapper(BaseMapper, ABC):
             shard_strategy=shard_strategy,
             graph_attention_backend=graph_attention_backend,
             edge_pre_mlp=edge_pre_mlp,
+            taper=taper,
+            taper_kind=taper_kind,
+            taper_sigma_init=taper_sigma_init,
+            taper_edge_length_index=taper_edge_length_index,
         )
 
         self.offload_layers(cpu_offload)
@@ -646,6 +654,10 @@ class GraphTransformerBackwardMapper(GraphTransformerBaseMapper):
         shard_strategy: str = "edges",
         graph_attention_backend: str = "triton",
         edge_pre_mlp: bool = False,
+        taper: bool = False,
+        taper_kind: str = "rbf",
+        taper_sigma_init: float = 1.0,
+        taper_edge_length_index: int = 0,
         **kwargs,
     ) -> None:
         """Initialize GraphTransformerBackwardMapper.
@@ -705,6 +717,10 @@ class GraphTransformerBackwardMapper(GraphTransformerBaseMapper):
             shard_strategy=shard_strategy,
             graph_attention_backend=graph_attention_backend,
             edge_pre_mlp=edge_pre_mlp,
+            taper=taper,
+            taper_kind=taper_kind,
+            taper_sigma_init=taper_sigma_init,
+            taper_edge_length_index=taper_edge_length_index,
             **kwargs,
         )
 

@@ -203,6 +203,20 @@ class DiffusionSchema(BaseModel):
     "Default parameters for inference sampling"
 
 
+class LatentFilterSchema(PydanticBaseModel):
+    """Band-limit the latent on the hidden mesh before the decoder.
+
+    Optional: omit the `latent_filter` key entirely and the model is unchanged.
+    See decoder-facetting docs/artifacts.md §18.8.
+    """
+
+    iterations: PositiveInt = Field(default=1)
+    "Rounds of self+neighbour averaging on the hidden mesh. 1 removes the near-Nyquist band."
+    edge_quantile: float = Field(default=0.75, gt=0.0, le=1.0)
+    "Keep only hidden->hidden edges at or below this length quantile, so the mesh's "
+    "long multi-scale edges do not smooth non-locally."
+
+
 class BaseModelSchema(PydanticBaseModel):
     num_channels: NonNegativeInt = Field(example=512)
     "Feature tensor size in the hidden space."
@@ -218,6 +232,8 @@ class BaseModelSchema(PydanticBaseModel):
     "Output mask"
     latent_skip: bool = True
     "Add skip connection in latent space before/after processor."
+    latent_filter: Optional[LatentFilterSchema] = Field(default=None)
+    "Optional band-limit of the latent before the decoder. None -> disabled."
     processor: Union[
         NoOpProcessorSchema,
         GNNProcessorSchema,

@@ -318,8 +318,46 @@ class SpectralLossSchema(BaseLossSchema):
         extra = "allow"
 
 
+class BandWeightedMSELossSchema(BaseModel):
+    # A Literal outside ImplementedLossesUsingBaseLossSchema, so that BaseLossSchema cannot
+    # match this target and drop the fields below.
+    target_: Literal["anemoi.training.losses.band_mse.BandWeightedMSELoss"] = Field(..., alias="_target_")
+    scalers: list[str] = Field(example=["node_weights"])
+    "Scalars to include in loss calculation"
+    ignore_nans: bool = False
+    predicted_variables: list[str]
+    "Variables the loss is applied to."
+    target_variables: list[str] | None = None
+    variables: list[str]
+    "Must repeat predicted_variables: the loss needs the names to select its statistics."
+    stats_path: str
+    "Statistics file written by anemoi.training.losses.band_mse.save_band_stats."
+    grid_shape: list[PositiveInt] = Field(min_length=2, max_length=2)
+    "(ny, nx) of the regular block at the start of the grid dimension."
+    grid_km: float
+    "Grid spacing of the block."
+    bands_km: list[float] = Field(min_length=1)
+    "Increasing half-amplitude wavelengths of the low-passes separating the bands."
+    band_weights: list[NonNegativeFloat] | None = None
+    "Weight per band, all 1 if not set. A band with weight 0 is not computed."
+    eps_factor: NonNegativeFloat = 1.0
+    "Floor on the truth variance, as a multiple of its median over the domain."
+    label: str = "band"
+    "Name used when logging the band values."
+
+    @model_validator(mode="after")
+    def check_bands_and_variables(self) -> Self:
+        if self.band_weights is not None and len(self.band_weights) != len(self.bands_km):
+            error_msg = "band_weights must have one entry per band in bands_km"
+            raise ValueError(error_msg)
+        if self.variables != self.predicted_variables:
+            error_msg = "variables must be identical to predicted_variables"
+            raise ValueError(error_msg)
+        return self
+
+
 class CombinedLossSchema(BaseLossSchema):
-    losses: list[BaseLossSchema | SpectralLossSchema] = Field(min_length=1)
+    losses: list[BaseLossSchema | SpectralLossSchema | BandWeightedMSELossSchema] = Field(min_length=1)
     "Losses to combine, can be any of the normal losses."
     loss_weights: list[int | float] | None = None
     "Weightings of losses, if not set, all losses are weighted equally."
@@ -354,6 +392,7 @@ LossSchemas = (
     | KernelCRPSSchema
     | SpectralLossSchema
     | MultiScaleLossSchema
+    | BandWeightedMSELossSchema
 )
 
 

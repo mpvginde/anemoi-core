@@ -7,6 +7,7 @@
 # granted to it by virtue of its status as an intergovernmental organisation
 # nor does it submit to any jurisdiction.
 
+from .band_mse import BandWeightedMSELoss
 from .combined import CombinedLoss
 from .huber import HuberLoss
 from .kcrps import AlmostFairKernelCRPS
@@ -27,6 +28,7 @@ from .weighted_mse import WeightedMSELoss
 
 __all__ = [
     "AlmostFairKernelCRPS",
+    "BandWeightedMSELoss",
     "CombinedLoss",
     "FourierCorrelationLoss",
     "HuberLoss",

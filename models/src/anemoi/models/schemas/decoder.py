@@ -46,6 +46,10 @@ class GraphTransformerDecoderSchema(TransformerModelComponent):
             "graph_attention_backend": str,
             "edge_pre_mlp": bool,
             "gradient_checkpointing": bool,
+            "taper": bool,
+            "taper_kind": str,
+            "taper_sigma_init": float,
+            "taper_edge_length_index": int,
         }
         extras = getattr(self, "__pydantic_extra__", {}) or {}
         for extra_field, value in extras.items():

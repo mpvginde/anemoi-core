@@ -105,6 +105,7 @@ class GraphTransformerConv(MessagePassing):
         edge_attr: OptTensor,
         edge_index: Adj,
         size: Optional[Size] = None,
+        taper_bias: OptTensor = None,
     ):
         dim_size = query.shape[0]
         heads = query.shape[1]
@@ -118,6 +119,7 @@ class GraphTransformerConv(MessagePassing):
             query=query,
             key=key,
             value=value,
+            taper_bias=taper_bias,
         )
 
         return out
@@ -132,11 +134,18 @@ class GraphTransformerConv(MessagePassing):
         index: Tensor,
         ptr: OptTensor,
         size_i: Optional[int],
+        taper_bias: OptTensor = None,
     ) -> Tensor:
         if edge_attr is not None:
             key_j = key_j + edge_attr
 
         alpha = (query_i * key_j).sum(dim=-1) / self.out_channels**0.5
+
+        # Per-head learnable distance taper: an additive bias on the pre-softmax
+        # logit that decays a neighbour's weight with edge length (see decoder
+        # facetting investigation). taper_bias has shape [num_edges, heads].
+        if taper_bias is not None:
+            alpha = alpha + taper_bias
 
         alpha = softmax(alpha, index, ptr, size_i)
         alpha = dropout(alpha, p=self.dropout, training=self.training)

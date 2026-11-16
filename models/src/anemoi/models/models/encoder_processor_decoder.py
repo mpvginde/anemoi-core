@@ -20,6 +20,7 @@ from torch.distributed.distributed_c10d import ProcessGroup
 from anemoi.models.distributed.graph import shard_tensor
 from anemoi.models.distributed.shapes import get_or_apply_shard_shapes
 from anemoi.models.distributed.shapes import get_shard_shapes
+from anemoi.models.layers.latent_filter import LatentLowPass
 from anemoi.models.layers.graph_provider import create_graph_provider
 from anemoi.models.models import BaseGraphModel
 from anemoi.utils.config import DotDict
@@ -61,6 +62,18 @@ class AnemoiModelEncProcDec(BaseGraphModel):
             src_size=self.node_attributes.num_nodes[self._graph_name_hidden],
             dst_size=self.node_attributes.num_nodes[self._graph_name_hidden],
             trainable_size=model_config.model.processor.get("trainable_size", 0),
+        )
+
+        # Optional band-limit of the latent before the decoder (decoder-facetting §18.8).
+        # Absent from the config -> None -> the model is unchanged.
+        latent_filter_cfg = model_config.model.get("latent_filter", None)
+        self.latent_filter = (
+            LatentLowPass(
+                self._graph_data[(self._graph_name_hidden, "to", self._graph_name_hidden)],
+                **latent_filter_cfg,
+            )
+            if latent_filter_cfg
+            else None
         )
 
         self.processor = instantiate(
@@ -287,6 +300,21 @@ class AnemoiModelEncProcDec(BaseGraphModel):
         # Latent skip connection
         if self.latent_skip:
             x_latent = x_latent_proc + x_latent
+
+        # Band-limit the latent so the decoder cannot render near-Nyquist hidden-mesh
+        # structure into sub-Nyquist output structure. Applied AFTER the skip so the
+        # encoder's contribution is filtered too — probes showed filtering only the
+        # processor's increment gives an identical result (§16.15).
+        # getattr, not self.latent_filter: anemoi inference checkpoints PICKLE THE MODEL
+        # OBJECT, so a checkpoint saved before this attribute existed unpickles without it
+        # while running the current class code. A bare attribute access raises
+        # AttributeError on every pre-existing checkpoint (seen in probe job 21784834).
+        latent_filter = getattr(self, "latent_filter", None)
+        if latent_filter is not None:
+            x_latent = latent_filter(
+                x_latent, model_comm_group=model_comm_group,
+                shard_shapes=shard_shapes_hidden,
+            )
 
         # Decoder
         x_out_dict = {}
