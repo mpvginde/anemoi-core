@@ -17,7 +17,7 @@ an epoch.
 Dataset Architecture
 ====================
 
-The data module provides two types of dataset readers that wrap
+The data module provides three types of dataset readers that wrap
 anemoi-datasets data:
 
 Native Grid Dataset
@@ -43,6 +43,66 @@ Trajectories are defined by:
 Each sample in the dataset is associated with a trajectory ID, ensuring
 that samples are correctly grouped and that trajectory boundaries are
 respected during training.
+
+Composite Native Grid Dataset
+-----------------------------
+
+The ``CompositeNativeGridDataset`` class reads a base dataset like
+``NativeGridDataset`` and replaces parts of each sample with data from
+the datasets listed under ``overrides``. The base dataset provides the
+grid, the statistics and the targets. Each override replaces one
+``region`` of the grid at some of the time steps of a sample
+(``times``), counted from its t_0:
+
+* ``region``: ``interior`` (the first grid of a ``cutout``),
+  ``boundary`` (the other grid points) or ``all``
+* ``times``: ``inputs`` (up to t_0), ``outputs`` (after t_0),
+  ``from_t0`` (from t_0 on) or ``all``
+
+A gridded source is read at the valid time of each time step. A
+trajectories source is read from the forecast initialised at t_0, at
+the lead time of each time step, so it can only replace ``outputs`` or
+``from_t0``. Grid points are matched to the nearest source grid point,
+at most ``max_distance_km`` away, and variables by name (all variables
+that both datasets have, unless ``variables`` lists them). Overrides are
+applied in order, and only the samples for which every override has its
+data are used.
+
+The interior after t_0 holds the loss targets, so it always comes from
+the base dataset. On the boundary, the values after t_0 are the lateral
+boundary conditions of the rollout and are not part of the loss.
+
+This makes it possible to fine-tune a limited area model trained on
+``cutout(CERRA, ERA5)`` with the data it gets operationally:
+
+.. code:: yaml
+
+   dataloader:
+     training:
+       datasets:
+         data:
+           dataset_config:
+             dataset: ${dataloader.dataset}  # cutout(CERRA, ERA5)
+             frequency: ${data.frequency}
+           start: null
+           end: 2020
+           overrides:
+             # IFS analysis interpolated to the CERRA grid on the interior
+             - region: interior
+               times: inputs
+               dataset_config:
+                 dataset: ifs-an-cerra-grid.zarr
+             # IFS analysis on the boundary
+             - region: boundary
+               times: inputs
+               dataset_config:
+                 dataset: ifs-an-n320.zarr
+             # The IFS forecast initialised at t_0 on the boundary.
+             # With times: from_t0, the boundary at t_0 is also taken from it.
+             - region: boundary
+               times: outputs
+               dataset_config:
+                 dataset: ifs-fc-n320-trajectories.zarr
 
 Multi-Dataset
 -------------

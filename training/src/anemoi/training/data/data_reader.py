@@ -72,7 +72,7 @@ def _normalize_reader_config(dataset_config: dict | DictConfig) -> dict:
         msg = "Missing required 'dataset_config' in dataset reader configuration."
         raise ValueError(msg)
 
-    allowed_keys = {"start", "end", "trajectory"}
+    allowed_keys = {"start", "end", "trajectory", "overrides"}
     unknown_keys = set(normalized) - allowed_keys
     if unknown_keys:
         unknown = ", ".join(sorted(unknown_keys))
@@ -82,6 +82,20 @@ def _normalize_reader_config(dataset_config: dict | DictConfig) -> dict:
 
     normalized["dataset_config"] = base_dataset_config
     return normalized
+
+
+def _read_trajectory_steps(data: object, sequence: int, positions: list[int]) -> np.ndarray:
+    """Read forecast steps ``positions`` of initialisation ``sequence`` of a trajectories dataset.
+
+    Returns an array of shape ``(variables, ensembles, steps, cells)``.
+    """
+    positions = normalize_time_indices(positions)
+    if isinstance(positions, slice):
+        # Read only the requested steps instead of the whole forecast; with per-step chunking
+        # this avoids reading and decompressing unused steps. Only slices take this path: a list
+        # index on the step axis is not applied correctly by anemoi-datasets.
+        return data[sequence, :, :, positions, :]
+    return data[sequence][:, :, positions, :]
 
 
 class BaseAnemoiReader:
@@ -427,17 +441,7 @@ class TrajectoryDataset(BaseAnemoiReader):
         """Load forecast steps ``positions`` of initialisation ``sequence``."""
         if isinstance(positions, slice):
             positions = range(*positions.indices(self.sequence_length(sequence)))
-        positions = normalize_time_indices(np.asarray(positions).tolist())
-
-        # data[sequence] -> (variables, ensembles, steps, cells)
-        if isinstance(positions, slice):
-            # Read only the requested steps instead of the whole forecast; with per-step chunking
-            # this avoids reading and decompressing unused steps. Only slices take this path: a list
-            # index on the step axis is not applied correctly by anemoi-datasets.
-            x = self.data[sequence, :, :, positions, :]
-        else:
-            x = self.data[sequence]
-            x = x[:, :, positions, :]
+        x = _read_trajectory_steps(self.data, sequence, np.asarray(positions).tolist())
         if grid_shard_indices is not None:
             x = x[..., grid_shard_indices]
 
@@ -456,10 +460,335 @@ class TrajectoryDataset(BaseAnemoiReader):
         return tree
 
 
+#: Grid points that a :class:`SourceOverride` can replace.
+OVERRIDE_REGIONS = ("interior", "boundary", "all")
+#: Time steps that a :class:`SourceOverride` can replace, relative to the anchor t_0 of a sample.
+OVERRIDE_TIMES = ("inputs", "outputs", "from_t0", "all")
+
+_EARTH_RADIUS_KM = 6371.0
+
+
+def _latlon_to_xyz(latitudes: np.ndarray, longitudes: np.ndarray) -> np.ndarray:
+    """Convert latitudes and longitudes in degrees to points on the unit sphere."""
+    lat = np.deg2rad(np.asarray(latitudes, dtype=np.float64))
+    lon = np.deg2rad(np.asarray(longitudes, dtype=np.float64))
+    return np.stack([np.cos(lat) * np.cos(lon), np.cos(lat) * np.sin(lon), np.sin(lat)], axis=-1)
+
+
+def _match_grid_points(
+    latitudes: np.ndarray,
+    longitudes: np.ndarray,
+    source_latitudes: np.ndarray,
+    source_longitudes: np.ndarray,
+) -> tuple[np.ndarray, float]:
+    """Return the nearest source point of each grid point, and the largest of these distances in km."""
+    from scipy.spatial import KDTree
+
+    tree = KDTree(_latlon_to_xyz(source_latitudes, source_longitudes))
+    chord, index = tree.query(_latlon_to_xyz(latitudes, longitudes))
+    distance_km = 2 * _EARTH_RADIUS_KM * np.arcsin(np.clip(np.asarray(chord) / 2, 0.0, 1.0))
+    largest_km = float(distance_km.max()) if distance_km.size else 0.0
+    return np.asarray(index, dtype=np.int64), largest_km
+
+
+def _check_override_options(region: str, times: str) -> None:
+    """Raise if an override replaces unknown grid points or time steps, or the loss targets."""
+    if region not in OVERRIDE_REGIONS:
+        msg = f"Unknown override region '{region}'. Choose one of {OVERRIDE_REGIONS}."
+        raise ValueError(msg)
+    if times not in OVERRIDE_TIMES:
+        msg = f"Unknown override times '{times}'. Choose one of {OVERRIDE_TIMES}."
+        raise ValueError(msg)
+    if region != "boundary" and times != "inputs":
+        msg = (
+            f"An override of region '{region}' can only replace the inputs (times: inputs), got '{times}'. "
+            "The interior at later time steps holds the loss targets, which always come from the base dataset."
+        )
+        raise ValueError(msg)
+
+
+class SourceOverride:
+    """A dataset that replaces part of the samples of a :class:`CompositeNativeGridDataset`.
+
+    It replaces the grid points of one ``region`` of the base dataset (the cutout ``interior``,
+    the ``boundary`` or ``all`` of them) at the time steps selected by ``times``, relative to the
+    anchor t_0 of each sample: ``inputs`` (offsets <= 0), ``outputs`` (offsets > 0), ``from_t0``
+    (offsets >= 0) or ``all``.
+
+    A gridded source is looked up on valid time. A trajectories source is looked up on the
+    forecast initialised at t_0, at a lead time equal to the offset of the time step, so it can
+    only replace time steps from t_0 onwards. Grid points are matched to the nearest source point,
+    variables by name.
+    """
+
+    def __init__(
+        self,
+        base: BaseAnemoiReader,
+        dataset_config: str | dict,
+        region: str,
+        times: str,
+        variables: list[str] | None = None,
+        max_distance_km: float = 1.0,
+    ) -> None:
+        _check_override_options(region, times)
+        self.region = region
+        self.times = times
+        self.data = open_dataset(_normalize_dataset_config(dataset_config))
+        self.is_trajectory = len(self.data.shape) == 5
+
+        if self.is_trajectory and times in ("inputs", "all"):
+            msg = (
+                f"Override {self.data} is a trajectories dataset, which has no forecast steps before its "
+                f"initialisation t_0, so it cannot replace times '{times}'. Use 'outputs' or 'from_t0'."
+            )
+            raise ValueError(msg)
+
+        ensembles = self.data.shape[2]
+        if ensembles not in (1, base.data.shape[2]):
+            msg = f"Override {self.data} has {ensembles} ensemble members, the base dataset {base.data.shape[2]}."
+            raise ValueError(msg)
+
+        self._match_grid(base, max_distance_km)
+        self._select_variables(base, variables)
+        self._index_times()
+
+    def _match_grid(self, base: BaseAnemoiReader, max_distance_km: float) -> None:
+        """Find the grid points of the base dataset that are replaced, and their nearest source points."""
+        if self.region == "all":
+            self.grid_indices = np.arange(base.grid_size)
+        else:
+            self.grid_indices = np.flatnonzero(base.cutout_mask if self.region == "interior" else base.boundary_mask)
+        self.source_grid_indices, self.matched_distance_km = _match_grid_points(
+            np.asarray(base.data.latitudes)[self.grid_indices],
+            np.asarray(base.data.longitudes)[self.grid_indices],
+            self.data.latitudes,
+            self.data.longitudes,
+        )
+        if self.matched_distance_km > max_distance_km:
+            msg = (
+                f"Override {self.data} does not have the grid points of region '{self.region}' of the base dataset: "
+                f"a grid point is {self.matched_distance_km:.3f} km from the nearest source point "
+                f"(max_distance_km={max_distance_km})."
+            )
+            raise ValueError(msg)
+
+    def _select_variables(self, base: BaseAnemoiReader, variables: list[str] | None) -> None:
+        """Select the variables that are replaced, by default all that both datasets have."""
+        source_name_to_index = self.data.name_to_index
+        if variables is None:
+            variables = [name for name in base.variables if name in source_name_to_index]
+        else:
+            variables = list(variables)
+            unknown = [name for name in variables if name not in base.name_to_index or name not in source_name_to_index]
+            if unknown:
+                msg = f"Override variables {unknown} are not in both the base dataset and {self.data}."
+                raise ValueError(msg)
+        if not variables:
+            msg = f"Override {self.data} has no variables in common with the base dataset."
+            raise ValueError(msg)
+
+        self.variables = variables
+        self.base_variable_indices = np.array([base.name_to_index[name] for name in variables], dtype=np.int64)
+        self.source_variable_indices = np.array([source_name_to_index[name] for name in variables], dtype=np.int64)
+        self.kept_variables = [name for name in base.variables if name not in set(variables)]
+        if self.kept_variables:
+            LOGGER.warning(
+                "Override %s (region %s, times %s) does not replace %s: they keep the values of the base dataset.",
+                self.data,
+                self.region,
+                self.times,
+                self.kept_variables,
+            )
+
+    def _index_times(self) -> None:
+        """Index the times (base dates for trajectories) and steps, in seconds, that can be read."""
+        missing = set(self.data.missing)
+        source_times = self.data.base_dates if self.is_trajectory else self.data.dates
+        source_times = np.asarray(source_times).astype("datetime64[s]").astype(np.int64)
+        self._time_index = {int(t): i for i, t in enumerate(source_times) if i not in missing}
+        self._available_times = np.fromiter(self._time_index, dtype=np.int64, count=len(self._time_index))
+        if self.is_trajectory:
+            steps = np.asarray(self.data.steps).astype("timedelta64[s]").astype(np.int64)
+            self._step_index = {int(s): i for i, s in enumerate(steps)}
+
+    def selects(self, offset: int) -> bool:
+        """Return whether the override replaces the time step at relative ``offset`` from t_0."""
+        if self.times == "inputs":
+            return offset <= 0
+        if self.times == "outputs":
+            return offset > 0
+        if self.times == "from_t0":
+            return offset >= 0
+        return True
+
+    def available(self, anchor_times: np.ndarray, offsets: list[int]) -> np.ndarray:
+        """Return which anchors can be read at all ``offsets``.
+
+        Anchors are given by the valid time of their t_0 and offsets as lead times, both in seconds.
+        """
+        if not offsets:
+            return np.ones(len(anchor_times), dtype=bool)
+        if self.is_trajectory:
+            if any(offset not in self._step_index for offset in offsets):
+                return np.zeros(len(anchor_times), dtype=bool)
+            return np.isin(anchor_times, self._available_times)
+        valid_times = anchor_times[:, None] + np.asarray(offsets, dtype=np.int64)[None, :]
+        return np.isin(valid_times, self._available_times).all(axis=1)
+
+    def read(self, anchor_time: int, offsets: list[int], grid_points: np.ndarray) -> np.ndarray:
+        """Read the source at ``offsets`` from ``anchor_time`` (seconds) and at the source ``grid_points``.
+
+        Returns an array of shape ``(times, ensemble, grid_points, variables)``.
+        """
+        if self.is_trajectory:
+            steps = [self._step_index[offset] for offset in offsets]
+            x = _read_trajectory_steps(self.data, self._time_index[anchor_time], steps)
+            x = x[self.source_variable_indices][..., grid_points]
+            return rearrange(x, "variables ensemble steps gridpoints -> steps ensemble gridpoints variables")
+
+        dates = normalize_time_indices([self._time_index[anchor_time + offset] for offset in offsets])
+        x = self.data[dates, :, :, :]
+        x = x[:, self.source_variable_indices][..., grid_points]
+        return rearrange(x, "dates variables ensemble gridpoints -> dates ensemble gridpoints variables")
+
+    def tree(self, prefix: str = "") -> Tree:
+        tree = Tree(f"{prefix}{self.region} grid points, {self.times} time steps")
+        tree.add(f"Dataset: {self.data}")
+        tree.add(f"Lookup: {'forecast initialised at t_0' if self.is_trajectory else 'valid time'}")
+        tree.add(f"Grid points: {len(self.grid_indices)} (largest source distance: {self.matched_distance_km:.3f} km)")
+        tree.add(f"Variables replaced: {len(self.variables)}")
+        tree.add(f"Variables kept from base: {self.kept_variables}")
+        return tree
+
+
+class CompositeNativeGridDataset(NativeGridDataset):
+    """Native grid dataset whose samples are partly read from other datasets.
+
+    The base dataset (``dataset_config``) is read as usual and provides the grid, the statistics
+    and the targets. Each :class:`SourceOverride` then replaces one region of the grid at some of
+    the time steps of every sample. Overrides are applied in order, so a later one wins.
+
+    This lets a limited area model trained on ``cutout(CERRA, ERA5)`` be fine-tuned with the data it
+    gets operationally: IFS analyses as inputs on the interior and the boundary and, on the boundary
+    at later time steps, the IFS forecast initialised at t_0, which then provides the lateral
+    boundary conditions during the rollout. The interior at later time steps holds the loss targets
+    and always comes from the base dataset.
+    """
+
+    def __init__(
+        self,
+        dataset: str | dict | None = None,
+        dataset_config: str | dict | None = None,
+        start: datetime.datetime | int | None = None,
+        end: datetime.datetime | int | None = None,
+        sampling: dict | None = None,
+        overrides: list[dict] | None = None,
+    ) -> None:
+        """Initialize CompositeNativeGridDataset."""
+        super().__init__(dataset=dataset, dataset_config=dataset_config, start=start, end=end, sampling=sampling)
+        if not overrides:
+            msg = "CompositeNativeGridDataset requires at least one override."
+            raise ValueError(msg)
+        self.overrides = [SourceOverride(self, **_as_dict(override)) for override in overrides]
+        self._times = np.asarray(self.data.dates).astype("datetime64[s]").astype(np.int64)
+        self._frequency_seconds = int(self.frequency.total_seconds())
+        #: Relative offsets (in positions) of the time steps of a sample, set by :meth:`compute_anchors`.
+        self._relative_indices: list[int] | None = None
+
+    def _replaced_steps(self, override: SourceOverride) -> tuple[list[int], list[int]]:
+        """Return the time steps of a sample that ``override`` replaces, and their offsets from t_0 in seconds."""
+        steps = [i for i, offset in enumerate(self._relative_indices) if override.selects(offset)]
+        return steps, [self._relative_indices[i] * self._frequency_seconds for i in steps]
+
+    def compute_anchors(
+        self,
+        relative_indices: list[int] | np.ndarray,
+        sampling: dict | None = None,
+    ) -> np.ndarray:
+        """Return the valid anchors of the base dataset at which every override can be read."""
+        anchors = super().compute_anchors(relative_indices, sampling)
+        self._relative_indices = [int(offset) for offset in relative_indices]
+
+        anchor_times = self._times[anchors[:, 1]]
+        keep = np.ones(len(anchors), dtype=bool)
+        for i, override in enumerate(self.overrides):
+            available = override.available(anchor_times, self._replaced_steps(override)[1])
+            LOGGER.info(
+                "Override %d (region %s, times %s) can be read at %d of %d anchors.",
+                i,
+                override.region,
+                override.times,
+                int(available.sum()),
+                len(anchors),
+            )
+            keep &= available
+        return anchors[keep]
+
+    def get_sample(
+        self,
+        sequence: int,
+        positions: TimeIndices,
+        grid_shard_indices: np.ndarray | slice | None = None,
+    ) -> torch.Tensor:
+        """Read the base sample and replace the parts that the overrides cover."""
+        if self._relative_indices is None:
+            msg = "compute_anchors must be called before get_sample: it sets the time steps of a sample."
+            raise RuntimeError(msg)
+
+        # A freshly read array, which is modified in place below.
+        x = super().get_sample(sequence, positions, grid_shard_indices)
+
+        if isinstance(positions, slice):
+            positions = range(*positions.indices(len(self._times)))
+        positions = np.atleast_1d(np.asarray(positions)).tolist()
+        if len(positions) != len(self._relative_indices):
+            msg = f"Expected {len(self._relative_indices)} time steps, got positions {positions}."
+            raise ValueError(msg)
+        anchor_time = int(self._times[positions[0] - self._relative_indices[0]])
+
+        # Position in the (possibly sharded) sample of each grid point of the base dataset, -1 if not loaded.
+        loaded = np.arange(self.grid_size)
+        if grid_shard_indices is not None:
+            loaded = loaded[grid_shard_indices]
+        local_index = np.full(self.grid_size, -1, dtype=np.int64)
+        local_index[loaded] = np.arange(len(loaded))
+
+        for override in self.overrides:
+            steps, offsets = self._replaced_steps(override)
+            local = local_index[override.grid_indices]
+            in_shard = local >= 0
+            if not steps or not in_shard.any():
+                continue
+
+            values = override.read(anchor_time, offsets, override.source_grid_indices[in_shard])
+            values = torch.from_numpy(np.ascontiguousarray(values)).to(x.dtype)
+            grid = torch.from_numpy(local[in_shard])
+            variables = torch.from_numpy(override.base_variable_indices)
+            for k, step in enumerate(steps):
+                x[step][:, grid[:, None], variables[None, :]] = values[k]
+
+        return x
+
+    def tree(self, prefix: str = "") -> Tree:
+        tree = super().tree(prefix)
+        for i, override in enumerate(self.overrides):
+            tree.add(override.tree(prefix=f"Override {i}: "))
+        return tree
+
+
 def create_dataset(dataset_config: dict, **_kwargs) -> BaseAnemoiReader:
     """Factory function to create a data reader based on the dataset configuration."""
     dataset_config = _normalize_reader_config(dataset_config)
     trajectory_config = _as_dict(dataset_config.pop("trajectory", None))
+    overrides = dataset_config.pop("overrides", None)
+
+    if trajectory_config is not None and overrides:
+        msg = "A dataset reader cannot have both 'trajectory' and 'overrides'."
+        raise ValueError(msg)
+
+    if overrides:
+        LOGGER.info("Creating CompositeNativeGridDataset...")
+        return CompositeNativeGridDataset(**dataset_config, overrides=list(overrides))
 
     if trajectory_config is not None:
         sampling = trajectory_config.get("sampling") if isinstance(trajectory_config, dict) else None

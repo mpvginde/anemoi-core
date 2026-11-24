@@ -11,10 +11,12 @@
 import datetime
 from pathlib import Path
 from typing import Any
+from typing import Literal
 
 from pydantic import BaseModel as PydanticBaseModel
 from pydantic import ConfigDict
 from pydantic import Field
+from pydantic import NonNegativeFloat
 from pydantic import NonNegativeInt
 from pydantic import PositiveInt
 from pydantic import RootModel
@@ -114,6 +116,29 @@ class TrajectoryDatasetSchema(NativeDatasetSchema):
     "Trajectory configuration."
 
 
+class OverrideSchema(BaseModel):
+    """Dataset replacing one region of the samples at some of their time steps."""
+
+    dataset_config: str | DatasetConfigSchema | Path
+    """Dataset definition passed to open_dataset. A gridded dataset is read at the valid time of each
+    time step; a trajectories dataset from the forecast initialised at t_0, at the lead time of each time step."""
+    region: Literal["interior", "boundary", "all"]
+    "Grid points replaced: the cutout interior, the boundary (its complement) or all of them."
+    times: Literal["inputs", "outputs", "from_t0", "all"]
+    "Time steps replaced, by offset from t_0: inputs (<= 0), outputs (> 0), from_t0 (>= 0) or all."
+    variables: list[str] | None = Field(default=None)
+    "Variables replaced. Defaults to all variables of the base dataset that the source dataset also has."
+    max_distance_km: NonNegativeFloat = Field(default=1.0)
+    "Largest allowed distance between a replaced grid point and its nearest source grid point."
+
+
+class CompositeDatasetSchema(NativeDatasetSchema):
+    """Dataset configuration schema with parts of the samples read from other datasets."""
+
+    overrides: list[OverrideSchema] = Field(min_length=1)
+    "Datasets replacing parts of each sample, applied in order (a later one wins)."
+
+
 class LoaderSet(BaseModel):
     training: NonNegativeInt | None = Field(example=None)
     "Value for training dataset"
@@ -150,11 +175,11 @@ class DataLoaderSchema(PydanticBaseModel):
     "Per-GPU batch size."
     limit_batches: LoaderSet = Field(example=None)
     "Limit number of batches to run. Default value null, will run on all the batches."
-    training: DatasetDict[NativeDatasetSchema | TrajectoryDatasetSchema]
+    training: DatasetDict[CompositeDatasetSchema | NativeDatasetSchema | TrajectoryDatasetSchema]
     "Training DatasetSchema."
-    validation: DatasetDict[NativeDatasetSchema | TrajectoryDatasetSchema]
+    validation: DatasetDict[CompositeDatasetSchema | NativeDatasetSchema | TrajectoryDatasetSchema]
     "Validation DatasetSchema."
-    test: DatasetDict[NativeDatasetSchema | TrajectoryDatasetSchema]
+    test: DatasetDict[CompositeDatasetSchema | NativeDatasetSchema | TrajectoryDatasetSchema]
     "Test DatasetSchema."
     read_group_size: PositiveInt = Field(example=None)
     "Number of GPUs per reader group. Defaults to number of GPUs (see BaseSchema validators)."
