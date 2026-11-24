@@ -522,3 +522,60 @@ class TestRenameTrajectories:
         assert ds.overrides[0].kept_variables == ["c"]
         with pytest.raises(ValueError, match=r"\['c'\] are not in both"):
             _make_composite([self._fc_override(fc_zarr, variables=VARIABLES)])
+
+
+@pytest.mark.usefixtures("open_fake")
+class TestClipMin:
+    """``clip_min`` raises source values below a lower bound before they replace the base values."""
+
+    def test_gridded_values_are_clipped(self, sources: dict[str, object]) -> None:
+        ds = _make_composite([_override("an-boundary.zarr", "boundary", "inputs", clip_min={"a": 0.0})])
+        ds.compute_anchors(RELATIVE_INDICES)
+        anchor = 4
+        x = _sample(ds, anchor)
+        base = sources["base.zarr"]
+
+        negatives = 0
+        for slot, offset in enumerate(RELATIVE_INDICES[:2]):
+            expected = _expected_gridded(sources["an-boundary.zarr"], base.dates[anchor + offset], BOUNDARY, VARIABLES)
+            negatives += int((expected[:, 0] < 0).sum())
+            np.testing.assert_array_equal(x[slot, 0, 4:, 0], np.maximum(expected[:, 0], 0.0))
+            np.testing.assert_array_equal(x[slot, 0, 4:, 1:], expected[:, 1:])  # b and c not clipped
+        assert negatives > 0  # the fake has values to clip
+        assert ds.overrides[0].clipped_count == negatives
+        # The base values at the outputs are not clipped.
+        np.testing.assert_array_equal(x[2:, 0], np.transpose(base.values[anchor + 1 : anchor + 3, :, 0], (0, 2, 1)))
+
+    def test_trajectory_values_are_clipped(self, sources: dict[str, object]) -> None:
+        ds = _make_composite([_override("fc.zarr", "boundary", "outputs", clip_min={"b": 0.25, "c": -0.5})])
+        ds.compute_anchors(RELATIVE_INDICES)
+        anchor = 4
+        x = _sample(ds, anchor)
+        t0 = sources["base.zarr"].dates[anchor]
+
+        for slot, offset in enumerate(RELATIVE_INDICES):
+            if offset > 0:
+                expected = _expected_forecast(sources["fc.zarr"], t0, 6 * offset, BOUNDARY)
+                np.testing.assert_array_equal(x[slot, 0, 4:, 0], expected[:, 0])
+                np.testing.assert_array_equal(x[slot, 0, 4:, 1], np.maximum(expected[:, 1], np.float32(0.25)))
+                np.testing.assert_array_equal(x[slot, 0, 4:, 2], np.maximum(expected[:, 2], np.float32(-0.5)))
+
+    def test_nan_is_kept(self, sources: dict[str, object]) -> None:
+        sources["an-boundary.zarr"].values[:, 0] = np.nan
+        ds = _make_composite([_override("an-boundary.zarr", "boundary", "inputs", clip_min={"a": 0.0})])
+        ds.compute_anchors(RELATIVE_INDICES)
+        x = _sample(ds, 4)
+        assert np.isnan(x[:2, 0, 4:, 0]).all()
+        assert ds.overrides[0].clipped_count == 0
+
+    def test_clip_min_must_name_replaced_variables(self) -> None:
+        # "b" is not in the interior analysis, so it is not replaced.
+        with pytest.raises(ValueError, match=r"clip_min variables \['b'\] are not replaced"):
+            _make_composite([_override("an-interior.zarr", "interior", "inputs", clip_min={"a": 0.0, "b": 0.0})])
+
+    def test_schema_passes_clip_min(self) -> None:
+        overrides = [_override("an-boundary.zarr", "boundary", "inputs", clip_min={"a": 0})]
+        parsed = CompositeDatasetSchema(dataset_config={"dataset": "base.zarr"}, overrides=overrides)
+        assert parsed.overrides[0].clip_min == {"a": 0.0}
+        ds = create_dataset(OmegaConf.create(parsed.model_dump(by_alias=True)))
+        assert ds.overrides[0].clip_min == {"a": 0.0}

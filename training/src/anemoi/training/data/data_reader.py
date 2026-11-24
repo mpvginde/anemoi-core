@@ -519,6 +519,9 @@ class SourceOverride:
     forecast initialised at t_0, at a lead time equal to the offset of the time step, so it can
     only replace time steps from t_0 onwards. Grid points are matched to the nearest source point,
     variables by name.
+
+    ``clip_min`` maps replaced variables to a lower bound applied to the source values before they
+    replace the base values (e.g. ``{"q_500": 0.0}`` for an analysis with negative humidity).
     """
 
     def __init__(
@@ -529,6 +532,7 @@ class SourceOverride:
         times: str,
         variables: list[str] | None = None,
         max_distance_km: float = 1.0,
+        clip_min: dict[str, float] | None = None,
     ) -> None:
         _check_override_options(region, times)
         self.region = region
@@ -550,6 +554,7 @@ class SourceOverride:
 
         self._match_grid(base, max_distance_km)
         self._select_variables(base, variables)
+        self._set_clip_min(clip_min)
         self._index_times()
 
     def _match_grid(self, base: BaseAnemoiReader, max_distance_km: float) -> None:
@@ -600,6 +605,32 @@ class SourceOverride:
                 self.kept_variables,
             )
 
+    def _set_clip_min(self, clip_min: dict[str, float] | None) -> None:
+        """Set the lower bounds per replaced variable, as a vector over the replaced variables."""
+        self.clip_min = dict(_as_dict(clip_min) or {})
+        unknown = [name for name in self.clip_min if name not in self.variables]
+        if unknown:
+            msg = f"Override clip_min variables {unknown} are not replaced by {self.data} (variables: {self.variables})."
+            raise ValueError(msg)
+        #: Number of source values raised to their lower bound, counted per process (for diagnostics).
+        self.clipped_count = 0
+        if not self.clip_min:
+            self._clip_columns = None
+            return
+        self._clip_columns = np.array([self.variables.index(name) for name in self.clip_min], dtype=np.int64)
+        self._clip_values = np.array(list(self.clip_min.values()), dtype=np.float64)
+
+    def _clip(self, x: np.ndarray) -> np.ndarray:
+        """Raise values below ``clip_min`` to it, in place; ``x`` has the variables last. NaNs are kept."""
+        if self._clip_columns is None:
+            return x
+        columns = x[..., self._clip_columns]
+        bounds = self._clip_values.astype(x.dtype)
+        below = columns < bounds
+        self.clipped_count += int(np.count_nonzero(below))
+        x[..., self._clip_columns] = np.where(below, bounds, columns)
+        return x
+
     def _index_times(self) -> None:
         """Index the times (base dates for trajectories) and steps, in seconds, that can be read."""
         missing = set(self.data.missing)
@@ -644,12 +675,13 @@ class SourceOverride:
             steps = [self._step_index[offset] for offset in offsets]
             x = _read_trajectory_steps(self.data, self._time_index[anchor_time], steps)
             x = x[self.source_variable_indices][..., grid_points]
-            return rearrange(x, "variables ensemble steps gridpoints -> steps ensemble gridpoints variables")
-
-        dates = normalize_time_indices([self._time_index[anchor_time + offset] for offset in offsets])
-        x = self.data[dates, :, :, :]
-        x = x[:, self.source_variable_indices][..., grid_points]
-        return rearrange(x, "dates variables ensemble gridpoints -> dates ensemble gridpoints variables")
+            x = rearrange(x, "variables ensemble steps gridpoints -> steps ensemble gridpoints variables")
+        else:
+            dates = normalize_time_indices([self._time_index[anchor_time + offset] for offset in offsets])
+            x = self.data[dates, :, :, :]
+            x = x[:, self.source_variable_indices][..., grid_points]
+            x = rearrange(x, "dates variables ensemble gridpoints -> dates ensemble gridpoints variables")
+        return self._clip(np.ascontiguousarray(x))
 
     def tree(self, prefix: str = "") -> Tree:
         tree = Tree(f"{prefix}{self.region} grid points, {self.times} time steps")
@@ -657,6 +689,8 @@ class SourceOverride:
         tree.add(f"Lookup: {'forecast initialised at t_0' if self.is_trajectory else 'valid time'}")
         tree.add(f"Grid points: {len(self.grid_indices)} (largest source distance: {self.matched_distance_km:.3f} km)")
         tree.add(f"Variables replaced: {len(self.variables)}")
+        if self.clip_min:
+            tree.add(f"Lower bounds: {self.clip_min}")
         tree.add(f"Variables kept from base: {self.kept_variables}")
         return tree
 

@@ -66,7 +66,9 @@ the lead time of each time step, so it can only replace ``outputs`` or
 at most ``max_distance_km`` away, and variables by name (all variables
 that both datasets have, unless ``variables`` lists them). Overrides are
 applied in order, and only the samples for which every override has its
-data are used.
+data are used. ``clip_min`` sets a lower bound per replaced variable,
+applied to the source values before they replace the base values, e.g.
+``clip_min: {q_500: 0.0}`` for an analysis with negative humidity.
 
 The interior after t_0 holds the loss targets, so it always comes from
 the base dataset. On the boundary, the values after t_0 are the lateral

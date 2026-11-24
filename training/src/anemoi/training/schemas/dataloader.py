@@ -130,6 +130,8 @@ class OverrideSchema(BaseModel):
     "Variables replaced. Defaults to all variables of the base dataset that the source dataset also has."
     max_distance_km: NonNegativeFloat = Field(default=1.0)
     "Largest allowed distance between a replaced grid point and its nearest source grid point."
+    clip_min: dict[str, float] | None = Field(default=None)
+    "Lower bound per replaced variable, applied to the source values before they replace the base values."
 
 
 class CompositeDatasetSchema(NativeDatasetSchema):
