@@ -435,3 +435,90 @@ def test_rollout_takes_the_boundary_from_the_forecast(sources: dict[str, object]
         x["data"][0, 1, 0, 4:].numpy(),
         _expected_forecast(sources["fc.zarr"], t0, 6, BOUNDARY),
     )
+
+
+def _write_trajectories_zarr(path: object, source: FakeTrajectories, variables: list[str]) -> str:
+    """Write ``source`` as a trajectories-layout zarr, with ``variables`` as its variable names."""
+    import zarr
+
+    _, _, ensembles, steps, cells = source.shape
+    root = zarr.open_group(str(path), mode="w")
+    root.create_dataset("data", data=source.values, chunks=(1, len(variables), ensembles, 1, cells))
+    root.create_dataset("base_dates", data=source.base_dates)
+    root.create_dataset("steps", data=source.steps.astype("timedelta64[us]"))
+    root.create_dataset("latitudes", data=source.latitudes)
+    root.create_dataset("longitudes", data=source.longitudes)
+    root.attrs.update(
+        layout="trajectories",
+        variables=list(variables),
+        frequency="12h",
+        steps={"start": "0h", "end": f"{6 * (steps - 1)}h", "frequency": "6h"},
+        resolution="fake",
+        missing_dates=[],
+        field_shape=[cells],
+        start_base_date=str(source.base_dates[0]),
+        end_base_date=str(source.base_dates[-1]),
+    )
+    return str(path)
+
+
+class TestRenameTrajectories:
+    """``rename`` in the dataset_config of a trajectories override, applied by the real open_dataset.
+
+    The forecast stores variable "c" as "c_fc" (like IFS ``tcw`` for the base's ``tciwv``).
+    """
+
+    @pytest.fixture
+    def fc_zarr(self, tmp_path: object, sources: dict[str, object]) -> str:
+        pytest.importorskip(
+            "anemoi.datasets.usage.trajectories.store",
+            reason="this anemoi-datasets cannot open trajectories-layout datasets",
+        )
+        return _write_trajectories_zarr(tmp_path / "fc.zarr", sources["fc.zarr"], ["b", "a", "c_fc"])
+
+    @pytest.fixture(autouse=True)
+    def open_fake_or_zarr(self, sources: dict[str, object]) -> Iterator[None]:
+        """Open the fakes by name and anything else with the real open_dataset."""
+        from anemoi.datasets import open_dataset
+
+        def _open(config: str | dict, **kwargs) -> object:
+            name = config["dataset"] if isinstance(config, dict) else config
+            return sources[name] if name in sources else open_dataset(config, **kwargs)
+
+        with patch("anemoi.training.data.data_reader.open_dataset", side_effect=_open):
+            yield
+
+    @staticmethod
+    def _fc_override(fc_zarr: str, rename: dict | None = None, **kwargs) -> dict:
+        dataset_config = {"dataset": fc_zarr} if rename is None else {"dataset": fc_zarr, "rename": rename}
+        return {"dataset_config": dataset_config, "region": "boundary", "times": "outputs", **kwargs}
+
+    def test_renamed_variable_is_replaced(self, fc_zarr: str, sources: dict[str, object]) -> None:
+        override = self._fc_override(fc_zarr, rename={"c_fc": "c"}, variables=VARIABLES)
+        ds = _make_composite([override])
+        assert ds.overrides[0].is_trajectory
+        assert ds.overrides[0].variables == VARIABLES
+        assert ds.overrides[0].kept_variables == []
+
+        ds.compute_anchors(RELATIVE_INDICES)
+        anchor = 4  # t_0 = 2020-01-02T00, a forecast base date
+        x = _sample(ds, anchor)
+        t0 = sources["base.zarr"].dates[anchor]
+        for slot, offset in enumerate(RELATIVE_INDICES):
+            if offset > 0:
+                np.testing.assert_array_equal(
+                    x[slot, 0, 4:],
+                    _expected_forecast(sources["fc.zarr"], t0, 6 * offset, BOUNDARY),
+                )
+
+    def test_old_name_is_unknown(self, fc_zarr: str) -> None:
+        override = self._fc_override(fc_zarr, rename={"c_fc": "c"}, variables=["a", "c_fc"])
+        with pytest.raises(ValueError, match=r"\['c_fc'\] are not in both"):
+            _make_composite([override])
+
+    def test_without_rename_the_variable_is_not_replaced(self, fc_zarr: str) -> None:
+        # By default the variable silently keeps its base value; an explicit list raises.
+        ds = _make_composite([self._fc_override(fc_zarr)])
+        assert ds.overrides[0].kept_variables == ["c"]
+        with pytest.raises(ValueError, match=r"\['c'\] are not in both"):
+            _make_composite([self._fc_override(fc_zarr, variables=VARIABLES)])
